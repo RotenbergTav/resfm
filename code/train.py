@@ -3,12 +3,12 @@ import sys
 import torch
 import math
 # import time
-import general_utils
+import utils.general_utils
 import loss_functions
 import evaluation
 import copy
 
-from general_utils import save_metrics_excel
+from utils.general_utils import save_metrics_excel
 from utils import path_utils, dataset_utils, plot_utils
 from utils.metrics_utils import OutliersMetrics, CalcMeanBatchMetrics, nanMetrics
 from time import time
@@ -260,11 +260,11 @@ def train(conf, train_data, model, phase, validation_data=None, test_data=None, 
 
                 if phase is Phases.TRAINING:
                     save_metrics_excel(conf, phase=Phases.VALIDATION, df=validation_metrics, epoch=epoch, append=False)
-                    general_utils.write_results(conf, validation_metrics2, file_name="Validation_over_epochs", append=True)
+                    utils.general_utils.write_results(conf, validation_metrics2, file_name="Validation_over_epochs", append=True)
                 elif phase is Phases.FINE_TUNE:
                     validation_metrics2 = validation_metrics2.drop(['Mean'])
                     # save_metrics_excel(conf, phase=Phases.FINE_TUNE, df=validation_metrics2, epoch=None, append=True)
-                    general_utils.write_results(conf, validation_metrics2, file_name="Validation_over_fine_tuning", phase=phase, append=True)
+                    utils.general_utils.write_results(conf, validation_metrics2, file_name="Validation_over_fine_tuning", phase=phase, append=True)
 
                 print(validation_metrics.to_string(), flush=True)
 
