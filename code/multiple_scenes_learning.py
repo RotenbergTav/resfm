@@ -32,6 +32,12 @@ def main():
     if phase is not Phases.FINE_TUNE:
         # Train model
         model = general_utils.get_class("models." + conf.get_string("model.type"))(conf).to(device)
+        
+        # --- DEBUG: confirm first block's first layer input size
+        first_block = model.equivariant_blocks[0]
+        first_layer = first_block.layers[0]  # SetOfSet{Attention}Layer
+        print("[model] first layer in_features =",
+            first_layer.lin_all.in_features)
         print(f'Number of parameters: {sum([x.numel() for x in model.parameters()])}')
         print(f'Number of trainable parameters:: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
 

@@ -205,3 +205,27 @@ def get_lsf_file_path(conf, args):
 
 def get_lsf_output_path(conf):
     return os.path.join(path_to_exp(conf), f'output_%J_%I.txt'), os.path.join(path_to_exp(conf), f'err_%J_%I.txt')
+
+
+def images_dir_for_scene(conf, scene_name: str) -> str:
+    root = conf.get_string("dataset.images_root")
+    base = scene_name.replace(".npz", "")
+    cand = os.path.join(root, f"{base} images")
+    if not os.path.isdir(cand):
+        raise FileNotFoundError(f"Images dir not found: {cand}")
+    return cand
+
+def superpoint_desc_path(conf, scene_name: str, image_fname: str) -> str:
+    """
+    Where to find a precomputed dense descriptor tensor for this image.
+    Default: <same folder as image>/<image_fname>.spdesc.pt
+    If dataset.superpoint.desc_dir is set, use <desc_dir>/<scene>/<image_fname>.spdesc.pt
+    """
+    base_dir = conf.get_string("dataset.superpoint.desc_dir", "")
+    if base_dir:
+        # e.g., desc_dir/5016 new images/<filename>.spdesc.pt
+        scene_dir = images_dir_for_scene(conf, scene_name)
+        leaf = f"{os.path.basename(image_fname)}.spdesc.pt"
+        return os.path.join(base_dir, os.path.basename(scene_dir), leaf)
+    else:
+        return os.path.join(os.path.dirname(image_fname), os.path.basename(image_fname) + ".spdesc.pt")

@@ -3,8 +3,10 @@ from utils import geo_utils, general_utils, sparse_utils, plot_utils
 from utils.Phases import Phases
 import numpy as np
 import networkx as nx
-
-
+import os
+import torch.nn.functional as F
+from utils import path_utils
+from utils.sparse_utils import SparseMat
 
 def is_valid_sample(data, min_pts_per_cam=10, phase=Phases.TRAINING):
     if phase is Phases.TRAINING:
@@ -206,3 +208,181 @@ def check_if_M_connected(M, thr=1, return_largest_component=False, returnAll=Fal
 
     return connected
 
+def _assign_sparse_desc_to_uv(kpts_xy: torch.Tensor,
+                              desc_DN: torch.Tensor,
+                              uv_pix: torch.Tensor,
+                              max_r: float = 6.0,
+                              k: int = 3,
+                              sigma: float = 2.0) -> torch.Tensor:
+    K = uv_pix.shape[0]
+    D = int(desc_DN.shape[0])
+    if kpts_xy.numel() == 0 or K == 0:
+        return torch.zeros((K, D), device=uv_pix.device, dtype=desc_DN.dtype)
+
+    uv = uv_pix.to(kpts_xy.device).unsqueeze(1)       # [K,1,2]
+    kp = kpts_xy.unsqueeze(0)                         # [1,N,2]
+    d2 = ((uv - kp) ** 2).sum(dim=-1)                 # [K,N]
+
+    if k <= 1:
+        idx = torch.argmin(d2, dim=1)
+        min_d2 = torch.gather(d2, 1, idx[:, None])[:, 0]
+        out = torch.zeros((K, D), device=uv.device, dtype=desc_DN.dtype)
+        ok = min_d2 <= (max_r * max_r)
+        if ok.any():
+            out[ok] = desc_DN[:, idx[ok]].T
+        return F.normalize(out, dim=-1)
+
+    k_eff = min(k, d2.shape[1])
+    d2_sorted, idx_sorted = torch.topk(d2, k_eff, dim=1, largest=False)   # [K,k]
+    ok_any = d2_sorted[:, 0] <= (max_r * max_r)
+
+    out = torch.zeros((K, D), device=uv.device, dtype=desc_DN.dtype)
+    if ok_any.any():
+        w = torch.exp(-d2_sorted[ok_any] / (2 * (sigma ** 2)))             # [Kok,k]
+        w = w / (w.sum(dim=1, keepdim=True) + 1e-8)
+        desc_sel = desc_DN.T[idx_sorted[ok_any]]                           # [Kok,k,D]
+        out[ok_any] = (w.unsqueeze(-1) * desc_sel).sum(dim=1)
+    return F.normalize(out, dim=-1)
+
+
+def attach_superpoint_features(scene, conf, device=None):
+    """
+    Attach SuperPoint descriptors by doing KNN assignment on-the-fly.
+      - For each camera i, take the observations' (u,v) from the ORIGINAL M (pixel coords),
+      - Load that camera's SP payload {kpts [N,2], desc [D,N], H, W},
+      - Assign KNN with gaussian weights to get one descriptor per observation,
+      - Concatenate to scene.x.values so feature dim becomes 2 + sp_dim.
+
+    Notes
+    -----
+    * scene.img_list[i] should be the image name/path for the i-th camera IN THIS scene (full or sampled).
+      We derive the SP payload path from it using path_utils.superpoint_desc_path(...).
+    """
+    # If _assign_sparse_desc_to_uv is defined in this module, we can call it directly.
+    # Otherwise, import it explicitly:
+    try:
+        _assign_fn = _assign_sparse_desc_to_uv  # noqa: F821 (provided in this module)
+    except NameError:
+        from utils.dataset_utils import _assign_sparse_desc_to_uv as _assign_fn
+
+    if not conf.get_bool("dataset.superpoint.enable", False):
+        return
+
+    x = scene.x
+    m = x.shape[0]
+    nnz = x.values.shape[0]
+    if nnz == 0 or m == 0:
+        return
+
+    device = device or x.values.device
+    sp_dim = conf.get_int("dataset.superpoint.dim", 256)
+
+    # If already attached for this x (2 reproj-features + SP dim), skip.
+    if x.values.shape[1] == 2 + sp_dim:
+        return
+    if x.values.shape[1] > 2 + sp_dim:
+        raise RuntimeError(f"{scene.scan_name}: unexpected feature width {x.values.shape[1]} (already augmented?)")
+
+    # Figure out how to map (i_samp, j_samp) -> (i_full, j_raw)
+    i_samp = x.indices[0].long()
+    j_samp = x.indices[1].long()
+
+    # Camera map
+    if hasattr(scene, "orig_cam_ids") and scene.orig_cam_ids is not None:
+        if scene.orig_cam_ids.numel() != m:
+            raise RuntimeError(f"{scene.scan_name}: orig_cam_ids length {scene.orig_cam_ids.numel()} != m {m}")
+        i_full_for_cam = scene.orig_cam_ids.long().to(device if scene.orig_cam_ids.is_cuda else "cpu")
+    else:
+        # Full scene fallback (identity)
+        i_full_for_cam = torch.arange(m, dtype=torch.long)
+
+    # Column (track) map
+    if hasattr(scene, "sampled_j_to_raw") and scene.sampled_j_to_raw is not None:
+        sampled_j_to_raw = scene.sampled_j_to_raw.long()
+        max_j = int(j_samp.max().item()) if j_samp.numel() > 0 else -1
+        if sampled_j_to_raw.numel() < (max_j + 1):  # strict bound
+            raise RuntimeError(
+                f"{scene.scan_name}: sampled_j_to_raw size {sampled_j_to_raw.numel()} <= max j_samp {max_j}"
+            )
+        # Compressed j (in this scene) -> RAW column id
+        j_raw_all = sampled_j_to_raw[j_samp]
+    else:
+        # Full scene fallback (identity: indices[1] are already RAW column ids)
+        j_raw_all = j_samp
+
+    # Prepare output buffer
+    desc_out = torch.zeros((nnz, sp_dim), dtype=torch.float32, device=device)
+
+    # Convenience for pixel coords
+    M_orig = scene.M_original
+    if isinstance(M_orig, torch.Tensor):
+        M_np = M_orig.cpu().numpy()
+    else:
+        M_np = M_orig  # already numpy
+
+    # Build per-camera image path list aligned to *this* scene's cameras (0..m-1)
+    # scene.img_list can be a tensor or list of names; we always use the per-scene index i_samp.
+    img_dir = path_utils.images_dir_for_scene(conf, scene.scan_name)
+    img_paths = []
+    if torch.is_tensor(scene.img_list):
+        names = scene.img_list.cpu().tolist()
+    else:
+        names = scene.img_list
+    for nm in names:
+        s = str(nm).strip()
+        img_paths.append(s if os.path.isabs(s) else os.path.join(img_dir, os.path.basename(s)))
+
+    # KNN params (match your precompute defaults)
+    k =  3
+    sigma = 2.0
+    min_r_px =  4.0
+    scale_r = 0.006
+    
+    print("attaching superpoint features, may take a while... ", end="", flush=True)
+    # Process camera by camera to avoid huge gathers
+    for i_cam in range(m):
+        cam_mask = (i_samp == i_cam)
+        if not torch.any(cam_mask):
+            continue
+
+        row_ids = torch.nonzero(cam_mask, as_tuple=False).squeeze(1)  # indices into x rows for this cam
+        # RAW track ids for these rows
+        j_raw = j_raw_all[row_ids].detach().cpu().numpy().astype(np.int64)
+
+        # Full-scene camera id (to read from M_original)
+        i_full = int(i_full_for_cam[i_cam].item())
+
+        # Pixel coords from ORIGINAL M (RAW columns)
+        u = M_np[2 * i_full + 0, j_raw]
+        v = M_np[2 * i_full + 1, j_raw]
+        uv_pix = torch.from_numpy(np.stack([u, v], axis=1)).float().to(device)
+
+        # Load SP payload for THIS scene's camera i_cam (path derived from scene.img_list[i_cam])
+        dpath = path_utils.superpoint_desc_path(conf, scene.scan_name, img_paths[i_cam])
+        if not os.path.isfile(dpath):
+            raise FileNotFoundError(f"{scene.scan_name}: missing SuperPoint payload for cam {i_cam}: {dpath}")
+        payload = torch.load(dpath, map_location="cpu")
+
+        kpts = payload["kpts"].float().to(device)  # [N,2]
+        desc = payload["desc"].float().to(device)  # [D,N]
+        desc = torch.nn.functional.normalize(desc, dim=0)
+
+        # Adaptive radius by long side, with a minimum
+        H = int(payload.get("H", 0)); W = int(payload.get("W", 0))
+        long_side = max(H, W) or 1600
+        adapt_r = max(min_r_px, scale_r * long_side)
+
+        # Assign descriptors to the observation pixels
+        D_ij = _assign_fn(kpts, desc, uv_pix, max_r=adapt_r, k=k, sigma=sigma)  # [K,D]
+        if D_ij.shape[1] != sp_dim:
+            raise RuntimeError(f"{scene.scan_name}: SP dim {D_ij.shape[1]} != expected {sp_dim}")
+
+        desc_out[row_ids] = D_ij.to(device=device, dtype=torch.float32)
+
+        # if ((i_cam + 1) % 10 == 0) or (i_cam + 1 == m):
+        #     print(f"[SP attach] {scene.scan_name}: cam {i_cam+1}/{m}  nnz_cam={row_ids.numel()}")
+
+    # Concatenate with existing x.values
+    new_vals = torch.cat([x.values.to(device), desc_out.to(x.values.dtype)], dim=-1)  # [nnz, 2 + sp_dim]
+    new_shape = (x.shape[0], x.shape[1], new_vals.shape[1])
+    scene.x = SparseMat(new_vals, x.indices, x.cam_per_pts, x.pts_per_cam, new_shape)

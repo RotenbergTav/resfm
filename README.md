@@ -71,6 +71,12 @@ python multiple_scenes_learning.py --conf confs/RESFM_Learning.conf --wandb 0 --
 ```
 
 
+To use Superpoint, precompute:
+```
+python precompute_superpoint.py --conf confs/RESF confs/RESFM_Learning.conf --images_root PATH/TO/IMAGES --out_root PATH/TO/OUTPUT --device cuda
+
+```
+
 
 ## Exporting to COLMAP Format
 

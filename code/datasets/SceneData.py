@@ -5,13 +5,10 @@ import os.path
 from pyhocon import ConfigFactory
 import numpy as np
 import warnings
-
-
-
-
+from utils import dataset_utils as du
 
 class SceneData:
-    def __init__(self, M, Ns, Ps_gt, scan_name, dilute_M=False, outliers=None, dict_info=None, nameslist=None, M_original=None):
+    def __init__(self, M, Ns, Ps_gt, scan_name, dilute_M=False, outliers=None, dict_info=None, nameslist=None, M_original=None, x_prebuilt=None):
 
         if M_original is None:
             M_original = M.detach().clone()
@@ -19,7 +16,6 @@ class SceneData:
         # Dilute M
         if dilute_M:
             M = geo_utils.dilutePoint(M)
-
 
         n_images = Ps_gt.shape[0]
 
@@ -31,8 +27,13 @@ class SceneData:
         self.Ns = Ns
         self.outlier_indices = outliers
 
-        # M to sparse matrix
-        self.x = dataset_utils.M2sparse(M, normalize=True, Ns=Ns, M_original=M_original)
+        # M to sparse matrix (use prebuilt if provided)
+        if x_prebuilt is not None:
+            self.x = x_prebuilt
+        else:
+            self.x = dataset_utils.M2sparse(M, normalize=True, Ns=Ns, M_original=M_original)
+            # identity (x uses RAW column ids; this is kept only for compatibility)
+            self.raw_cols_kept = torch.arange(M.shape[1], dtype=torch.long)
 
         # Get image list
         if nameslist is None:
@@ -79,8 +80,9 @@ def create_scene_data(conf, phase=None):
     else:
         raise ValueError("The code doesn't support the uncalibrated case")
 
-    return SceneData(M, Ns, Ps_gt, scan, dilute_M, outliers=outliers, dict_info=dict_info, nameslist=namesList, M_original=M_original)
-
+    data = SceneData(M, Ns, Ps_gt, scan, dilute_M, outliers=outliers, dict_info=dict_info, nameslist=namesList, M_original=M_original)
+    du.attach_superpoint_features(data, conf, device=data.x.values.device)
+    return data
 
 def sample_data(data, num_samples, adjacent=True):
     """For a given scene, randomly sample num_samples cameras (rows), adjacent or not.
@@ -93,17 +95,105 @@ def sample_data(data, num_samples, adjacent=True):
     indices = torch.from_numpy(indices).squeeze()
     M_indices = torch.from_numpy(M_indices).squeeze()
 
-    # Get sampled data
-    y, Ns = data.y[indices], data.Ns[indices]
-    M = data.M[M_indices]
+    # slice dense tensors
+    y  = data.y[indices]
+    Ns = data.Ns[indices]
+    M_rows = data.M[M_indices]
     outlier_indices = data.outlier_indices[indices]
-    outlier_indices = outlier_indices[:, (M > 0).sum(dim=0) > 2]
 
-    M = M[:, (M > 0).sum(dim=0) > 2]
+    col_keep_raw = (M_rows > 0).sum(dim=0) > 2
+    keep_raw = torch.nonzero(col_keep_raw, as_tuple=False).squeeze(1).long()
 
+    outlier_indices = outlier_indices[:, col_keep_raw]
+    M = M_rows[:, col_keep_raw]
 
+    if torch.is_tensor(data.img_list):
+        names_sel = data.img_list[indices]
+    else:
+        names_sel = [data.img_list[i] for i in indices.tolist()]
 
-    sampled_data = SceneData(M, Ns, y, data.scan_name,outliers=outlier_indices, nameslist=data.img_list[indices])
+    # ================= slice EXISTING sparse x (no rebuild) =================
+    x_parent = data.x
+    ii_old = x_parent.indices[0]
+    jj_old = x_parent.indices[1]
+    feat   = x_parent.values.shape[1]
+
+    # map old camera id -> new camera id (or -1 if not sampled)
+    m_old = x_parent.shape[0]
+    old_to_new_i = torch.full((m_old,), -1, dtype=torch.long, device=ii_old.device)
+    for new_i, old_i in enumerate(indices.tolist()):
+        old_to_new_i[old_i] = new_i
+
+    # for every row in parent x, RAW column id is just jj_old
+    raw_j_all = jj_old
+
+    # which rows belong to sampled cameras?
+    i_new_all = old_to_new_i[ii_old]
+    cam_kept_for_row = i_new_all >= 0
+
+    # which rows belong to RAW columns we keep in the sampled scene?
+    col_kept_for_row = col_keep_raw.to(raw_j_all.device)[raw_j_all]
+
+    # observation must actually exist for that sampled (cam, raw_col)
+    obs_for_row = torch.zeros_like(cam_kept_for_row, dtype=torch.bool)
+    sel_basic = cam_kept_for_row & col_kept_for_row
+    if sel_basic.any():
+        i_new_sel = i_new_all[sel_basic].cpu()
+        rj_sel    = raw_j_all[sel_basic].cpu()
+        u = M_rows[2 * i_new_sel + 0, rj_sel]
+        v = M_rows[2 * i_new_sel + 1, rj_sel]
+        obs_for_row[sel_basic] = ((u != 0) | (v != 0)).to(obs_for_row.device)
+
+    keep_rows = sel_basic & obs_for_row
+
+    if not keep_rows.any():
+        sampled_x = sparse_utils.SparseMat(
+            values=torch.zeros((0, feat), dtype=x_parent.values.dtype, device=x_parent.values.device),
+            indices=torch.zeros((2, 0), dtype=torch.long, device=x_parent.indices.device),
+            cam_per_pts=torch.zeros((0, 1), dtype=torch.long, device=x_parent.cam_per_pts.device),
+            pts_per_cam=torch.zeros((len(indices), 1), dtype=torch.long, device=x_parent.pts_per_cam.device),
+            shape=(len(indices), 0, feat),
+        )
+    else:
+        # keep rows
+        vals_keep   = x_parent.values[keep_rows]
+        raw_j_keep  = raw_j_all[keep_rows]
+
+        # remap cameras to [0..m_sample-1]
+        ii_new = i_new_all[keep_rows]
+
+        # remap RAW columns to compact [0..n_sample-1] in the SAME RAW order as M
+        raw_to_newpos = -torch.ones((data.M.shape[1],), dtype=torch.long, device=raw_j_all.device)
+        raw_to_newpos[keep_raw.to(raw_j_all.device)] = torch.arange(
+            keep_raw.numel(), dtype=torch.long, device=raw_j_all.device
+        )
+        jj_new = raw_to_newpos[raw_j_keep]
+
+        # build counts
+        m_new = len(indices)
+        n_new = keep_raw.numel()
+        cam_per_pts = torch.bincount(jj_new, minlength=n_new).view(-1, 1)
+        pts_per_cam = torch.bincount(ii_new, minlength=m_new).view(-1, 1)
+
+        new_indices = torch.stack([ii_new, jj_new], dim=0)
+
+        sampled_x = sparse_utils.SparseMat(
+            values=vals_keep,
+            indices=new_indices,
+            cam_per_pts=cam_per_pts.to(x_parent.cam_per_pts.device),
+            pts_per_cam=pts_per_cam.to(x_parent.pts_per_cam.device),
+            shape=(m_new, n_new, feat),
+        )
+    # ======================================================================
+
+    sampled_data = SceneData(
+        M, Ns, y, data.scan_name,
+        outliers=outlier_indices,
+        nameslist=names_sel,
+        M_original=data.M_original,
+        x_prebuilt=sampled_x,           # << use prebuilt sparse
+    )
+
     if (sampled_data.x.pts_per_cam == 0).any():
         warnings.warn('Cameras with no points for dataset '+ data.scan_name)
 
